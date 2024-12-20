@@ -6,150 +6,74 @@ from scipy.stats import multivariate_normal
 
 class GMM():
     def __init__(self, k, dim, init_mu=None, init_sigma=None, init_pi=None, colors=None, learning_rate=0.01):
-        '''
-        Define a model with known number of clusters and dimensions.
-        input:
-            - k: Number of Gaussian clusters
-            - dim: Dimension
-            - init_mu: initial value of mean of clusters (k, dim)
-                       (default) random from uniform[-10, 10]
-            - init_sigma: initial value of covariance matrix of clusters (k, dim, dim)
-                          (default) Identity matrix for each cluster
-            - init_pi: initial value of cluster weights (k,)
-                       (default) equal value to all cluster i.e. 1/k
-            - colors: Color valu for plotting each cluster (k, 3)
-                      (default) random from uniform[0, 1]
-        '''
         self.k = k
         self.dim = dim
         self.learning_rate = learning_rate
-        if (init_mu is None):
+        if init_mu is None:
             init_mu = np.random.rand(k, dim) * 20 - 10
         self.mu = init_mu
-        if (init_sigma is None):
+        if init_sigma is None:
             init_sigma = np.zeros((k, dim, dim))
             for i in range(k):
                 init_sigma[i] = np.eye(dim)
         self.sigma = init_sigma
-        if (init_pi is None):
+        if init_pi is None:
             init_pi = np.ones(self.k) / self.k
         self.pi = init_pi
-        if (colors is None):
+        if colors is None:
             colors = np.random.rand(k, 3)
         self.colors = colors
-
-    def init_em(self, X):
-        '''
-        Initialization for EM algorithm.
-        input:
-            - X: data (batch_size, dim)
-        '''
+    def init_gibbs(self, X):
         self.data = X
         self.num_points = X.shape[0]
         self.z = np.zeros((self.num_points, self.k))
-
-    def e_step(self):
-        '''
-        E-step of EM algorithm.
-        '''
-        for i in range(self.k):
-            self.z[:, i] = self.pi[i] * multivariate_normal.pdf(self.data, mean=self.mu[i], cov=self.sigma[i])
-        self.z /= self.z.sum(axis=1, keepdims=True)
-
-    def m_step(self):
-        '''
-        M-step of EM algorithm.
-        '''
-        sum_z = self.z.sum(axis=0)
-        self.pi = sum_z / self.num_points
-        self.mu = np.matmul(self.z.T, self.data)
-        self.mu /= sum_z[:, None]
-        for i in range(self.k):
-            j = np.expand_dims(self.data, axis=1) - self.mu[i]
-            s = np.matmul(j.transpose([0, 2, 1]), j)
-            self.sigma[i] = np.matmul(s.transpose(1, 2, 0), self.z[:, i])
-            self.sigma[i] /= sum_z[i]
-
-    def sgd_update_mu_sigma(self):
-        ''' SGD update for means and covariances. '''
-        epsilon = 1e-6  # Small regularization term for numerical stability
-
-        for i in range(self.k):
-            # Gradient for mu
-            gradient_mu = np.zeros(self.dim)
-            for j in range(self.num_points):
-                z_ij = self.z[j, i]  # Responsibility of cluster i for data point j
-                diff = self.data[j] - self.mu[i]  # x_j - mu_i
-                # No need for covariance inverse here, just use diff
-                gradient_mu += z_ij * diff  # Weighted gradient
-
-            # Update the mean with SGD
-            self.mu[i] += self.learning_rate * gradient_mu
-
-            # Gradient for sigma (updating the covariance matrix)
-            gradient_sigma = np.zeros((self.dim, self.dim))
-            for j in range(self.num_points):
-                z_ij = self.z[j, i]  # Responsibility of cluster i for data point j
-                diff = (self.data[j] - self.mu[i]).reshape(-1, 1)
-                # Covariance update based on the outer product of diff
-                gradient_sigma += z_ij * (np.matmul(diff, diff.T))
-
-            # Update sigma using SGD
-            self.sigma[i] = (1 - self.learning_rate) * self.sigma[i] + self.learning_rate * gradient_sigma
-
-            # Ensure symmetry (though this should usually be symmetric)
-            self.sigma[i] = (self.sigma[i] + self.sigma[i].T) / 2
-
-            # Add small regularization to ensure positive semidefiniteness
-            self.sigma[i] += epsilon * np.eye(self.dim)
-    # def sgd_update_mu_sigma(self):
-    #     ''' SGD update for means and covariances. '''
-    #     for i in range(self.k):
-    #         # Gradient for mu
-    #         gradient_mu = np.zeros(self.dim)
-    #         for j in range(self.num_points):
-    #             z_ij = self.z[j, i]  # Responsibility of cluster i for data point j
-    #             diff = self.data[j] - self.mu[i]  # x_j - mu_i
-    #             gradient_mu += z_ij * np.matmul(np.linalg.inv(self.sigma[i]), diff)  # Weighted gradient
-    #
-    #         # Update the mean with SGD
-    #         self.mu[i] += self.learning_rate * gradient_mu
-    #
-    #         # Gradient for sigma
-    #         gradient_sigma = np.zeros((self.dim, self.dim))
-    #         for j in range(self.num_points):
-    #             z_ij = self.z[j, i]  # Responsibility of cluster i for data point j
-    #             diff = (self.data[j] - self.mu[i]).reshape(-1, 1)
-    #             gradient_sigma += z_ij * (np.matmul(diff, diff.T) - self.sigma[i])  # Covariance update
-    #
-    #         # Update sigma using SGD
-    #         self.sigma[i] += self.learning_rate * gradient_sigma
-
-    def gibbs_sampler(self):
-        '''
-        Gibbs sampling step to update the z_i (cluster assignments for each x_i)
-        based on the current parameters (mu, sigma, pi).
-        '''
+    def gibbs_update(self):
+        # Update cluster assignments z_i based on posterior probabilities
         for i in range(self.num_points):
-            # Compute the posterior probability for each cluster z_i
             posteriors = np.zeros(self.k)
             for j in range(self.k):
                 posteriors[j] = self.pi[j] * multivariate_normal.pdf(self.data[i], mean=self.mu[j], cov=self.sigma[j])
-            # Normalize to get valid probabilities
-            posteriors /= np.sum(posteriors)
-
-            # Sample z_i from the categorical distribution given by posteriors
-            self.z[i] = np.zeros(self.k)  # Reset the vector
-            self.z[i, np.random.multinomial(1, posteriors).argmax()] = 1  # Set one-hot encoding
-
+            # Check for valid posteriors and normalize them
+            total_posterior = np.sum(posteriors)
+            if total_posterior > 0:
+                posteriors /= total_posterior  # Normalize posteriors
+                # Use multinomial sampling for cluster assignment
+                self.z[i] = np.zeros(self.k)
+                chosen_cluster = np.random.multinomial(1, posteriors).argmax()
+                self.z[i, chosen_cluster] = 1
+            else:
+                # If total_posterior is zero, assign uniformly or handle appropriately
+                self.z[i] = np.random.dirichlet(np.ones(self.k))  # Uniform assignment
+    def sgld_update(self):
+        epsilon = 1e-6  # Small constant for numerical stability
+        for i in range(self.k):
+            # Select points assigned to cluster i
+            assigned_points = self.data[self.z[:, i] > 0]
+            if len(assigned_points) > 0:
+                # Mean update using SGLD with preconditioning
+                gradient_mu = np.zeros(self.dim)
+                for x in assigned_points:
+                    gradient_mu += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (x - self.mu[i])
+                # Fisher Information Matrix (FIM) for mu_k is simply sigma_k^{-1}
+                fim_mu_inv = np.linalg.inv(self.sigma[i])
+                noise_mu = np.random.normal(0, np.sqrt(2 * self.learning_rate), size=self.mu[i].shape)
+                self.mu[i] += (self.learning_rate * fim_mu_inv @ gradient_mu / len(assigned_points)) + noise_mu
+                # Covariance update using SGLD with preconditioning
+                gradient_sigma = np.zeros((self.dim, self.dim))
+                for x in assigned_points:
+                    diff = (x - self.mu[i]).reshape(-1, 1)
+                    gradient_sigma += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (diff @ diff.T)
+                noise_sigma = np.random.normal(0, np.sqrt(2 * self.learning_rate), size=self.sigma[i].shape)
+                # FIM for sigma_k is more complex; here we assume a simple structure.
+                fim_sigma_inv = 2 * np.linalg.inv(self.sigma[i])  # Simplified assumption
+                self.sigma[i] += (self.learning_rate * fim_sigma_inv @ gradient_sigma / len(assigned_points)) + noise_sigma
+                # Ensure covariance is symmetric and positive definite
+                self.sigma[i] = (self.sigma[i] + self.sigma[i].T) / 2 + epsilon * np.eye(self.dim)
+                # Adjust negative eigenvalues if necessary to ensure positive definiteness
+                eigvals, eigvecs = np.linalg.eigh(self.sigma[i])
+                eigvals[eigvals < 0] = epsilon  # Set negative eigenvalues to epsilon
+                self.sigma[i] = eigvecs @ np.diag(eigvals) @ eigvecs.T
     def log_likelihood(self, X):
-        '''
-        Compute the log-likelihood of X under current parameters
-        input:
-            - X: Data (batch_size, dim)
-        output:
-            - log-likelihood of X: Sum_n Sum_k log(pi_k * N( X_n | mu_k, sigma_k ))
-        '''
         ll = []
         for d in X:
             tot = 0
