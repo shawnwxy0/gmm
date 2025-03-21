@@ -1,8 +1,18 @@
 import numpy as np
+import matplotlib.pyplot as plt
 from matplotlib.patches import Ellipse
 import matplotlib.transforms as transforms
 from scipy.stats import multivariate_normal
 
+class PSDMap:
+    def __init__(self, dim, epsilon=1e-6):
+        self.dim = dim
+        self.epsilon = epsilon
+    def map(self, matrix):
+        matrix = (matrix + matrix.T) / 2
+        eigvals, eigvecs = np.linalg.eigh(matrix)
+        eigvals = np.maximum(eigvals, self.epsilon)
+        return eigvecs @ np.diag(eigvals) @ eigvecs.T
 
 class GMM():
     def __init__(self, k, dim, init_mu=None, init_sigma=None, init_pi=None, colors=None, learning_rate=0.01):
@@ -30,51 +40,41 @@ class GMM():
         self.z = np.zeros((self.num_points, self.k))
         
     def gibbs_update(self):
-        # Update cluster assignments z_i based on posterior probabilities
         for i in range(self.num_points):
             posteriors = np.zeros(self.k)
             for j in range(self.k):
                 posteriors[j] = self.pi[j] * multivariate_normal.pdf(self.data[i], mean=self.mu[j], cov=self.sigma[j])
-            # Check for valid posteriors and normalize them
             total_posterior = np.sum(posteriors)
             if total_posterior > 0:
-                posteriors /= total_posterior  # Normalize posteriors
-                # Use multinomial sampling for cluster assignment
+                posteriors /= total_posterior
                 self.z[i] = np.zeros(self.k)
                 chosen_cluster = np.random.multinomial(1, posteriors).argmax()
                 self.z[i, chosen_cluster] = 1
             else:
-                # If total_posterior is zero, assign uniformly or handle appropriately
-                self.z[i] = np.random.dirichlet(np.ones(self.k))  # Uniform assignment
+                self.z[i] = np.random.dirichlet(np.ones(self.k))
                 
     def sgld_update(self):
-        epsilon = 1e-6  # Small constant for numerical stability
+        epsilon = 1e-6
         for i in range(self.k):
-            # Select points assigned to cluster i
             assigned_points = self.data[self.z[:, i] > 0]
             if len(assigned_points) > 0:
-                # Mean update using SGLD with preconditioning
                 gradient_mu = np.zeros(self.dim)
                 for x in assigned_points:
                     gradient_mu += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (x - self.mu[i])
-                # Update for mu_k using Sigma_k as a preconditioner
                 noise_mu = np.random.normal(0, np.sqrt(2 * self.learning_rate), size=self.mu[i].shape)
                 self.mu[i] += (self.learning_rate * self.sigma[i] @ gradient_mu / len(assigned_points)) + noise_mu
-                # Covariance update using SGLD with preconditioning
                 gradient_sigma = np.zeros((self.dim, self.dim))
                 for x in assigned_points:
                     diff = (x - self.mu[i]).reshape(-1, 1)
                     gradient_sigma += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (diff @ diff.T)
                 noise_sigma = np.random.normal(0, np.sqrt(2 * self.learning_rate), size=self.sigma[i].shape)
-                # Update for Sigma_k using (2 Sigma_k ⊗ Sigma_k) as a preconditioner
                 preconditioned_update_sigma = (2 * self.sigma[i] @ gradient_sigma) / len(assigned_points)
                 self.sigma[i] += preconditioned_update_sigma + noise_sigma
-                # Ensure covariance is symmetric and positive definite
                 self.sigma[i] = (self.sigma[i] + self.sigma[i].T) / 2 + epsilon * np.eye(self.dim)
-                # Adjust negative eigenvalues if necessary to ensure positive definiteness
                 eigvals, eigvecs = np.linalg.eigh(self.sigma[i])
-                eigvals[eigvals < 0] = epsilon  # Set negative eigenvalues to epsilon
+                eigvals[eigvals < 0] = epsilon
                 self.sigma[i] = eigvecs @ np.diag(eigvals) @ eigvecs.T
+                self.sigma[i] = PSDMap(self.dim).map(self.sigma[i])
                 
     def log_likelihood(self, X):
         ll = []
@@ -89,25 +89,49 @@ class GMM():
         pearson = cov[0, 1] / np.sqrt(cov[0, 0] * cov[1, 1])
         ell_radius_x = np.sqrt(1 + pearson)
         ell_radius_y = np.sqrt(1 - pearson)
-        ellipse = Ellipse((0, 0),
-                          width=ell_radius_x * 2,
-                          height=ell_radius_y * 2,
-                          facecolor=facecolor,
-                          **kwargs)
+        ellipse = Ellipse((0, 0), width=ell_radius_x * 2, height=ell_radius_y * 2, facecolor=facecolor, **kwargs)
         scale_x = np.sqrt(cov[0, 0]) * n_std
         mean_x = mean[0]
         scale_y = np.sqrt(cov[1, 1]) * n_std
         mean_y = mean[1]
-        transf = transforms.Affine2D() \
-            .rotate_deg(45) \
-            .scale(scale_x, scale_y) \
-            .translate(mean_x, mean_y)
+        transf = transforms.Affine2D().rotate_deg(45).scale(scale_x, scale_y).translate(mean_x, mean_y)
         ellipse.set_transform(transf + ax.transData)
         return ax.add_patch(ellipse)
         
     def draw(self, ax, n_std=2.0, facecolor='none', **kwargs):
-        if (self.dim != 2):
+        if self.dim != 2:
             print("Drawing available only for 2D case.")
             return
         for i in range(self.k):
             self.plot_gaussian(self.mu[i], self.sigma[i], ax, n_std=n_std, edgecolor=self.colors[i], **kwargs)
+
+def main():
+    np.random.seed(42)
+    k = 2
+    dim = 2
+    n_points = 500
+    true_mu = np.array([[2, 2], [-2, -2]])
+    true_sigma = np.array([[[1, 0.5], [0.5, 1]], [[1, -0.3], [-0.3, 1]]])
+    true_pi = np.array([0.6, 0.4])
+    data = []
+    labels = []
+    for i in range(n_points):
+        comp = np.random.choice(k, p=true_pi)
+        sample = np.random.multivariate_normal(true_mu[comp], true_sigma[comp])
+        data.append(sample)
+        labels.append(comp)
+    data = np.array(data)
+    model = GMM(k, dim)
+    model.init_gibbs(data)
+    n_iter = 50
+    for i in range(n_iter):
+        model.gibbs_update()
+        model.sgld_update()
+    fig, ax = plt.subplots(figsize=(8, 6))
+    ax.scatter(data[:, 0], data[:, 1], c=labels, cmap='viridis', alpha=0.6)
+    model.draw(ax, n_std=2.0, facecolor='none', linewidth=2)
+    ax.set_title("GMM Clustering and Learned Gaussian Contours")
+    plt.show()
+
+if __name__ == "__main__":
+    main()
