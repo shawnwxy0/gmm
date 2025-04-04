@@ -1,236 +1,159 @@
 import numpy as np
+import autograd.numpy as np
 import matplotlib.pyplot as plt
-from matplotlib.patches import Ellipse
 from scipy.stats import multivariate_normal
+from paragami import PatternDict, NumericVectorPattern, NumericArrayPattern
 
-class PSDMap:
-    def __init__(self, dim, epsilon=1e-6):
-        self.dim = dim
-        self.epsilon = epsilon
-        
-    def map(self, matrix):
-        matrix = (matrix + matrix.T) / 2
-        eigvals, eigvecs = np.linalg.eigh(matrix)
-        eigvals = np.maximum(eigvals, self.epsilon)
-        return eigvecs @ np.diag(eigvals) @ eigvecs.T
 
-class GMM:
-    def __init__(
-        self,
-        k,
-        dim,
-        init_mu=None,
-        init_sigma=None,
-        init_pi=None,
-        colors=None,
-        learning_rate=0.005,
-        decay=0.01,
-        update_pi=True,
-        burn_in=50,
-        max_iter=200,
-        cov_reg=1e-6
-    ):
-        self.k = k
+class SGLD_GMM:
+    def __init__(self, num_samples=1000, num_clusters=3, dim=2, eta=0.01, num_iterations=5000, burn_in=1000, k=1):
+        np.random.seed(42)
+        self.num_samples = num_samples
+        self.num_clusters = num_clusters
         self.dim = dim
-        self.learning_rate = learning_rate
-        self.decay = decay
-        self.update_pi_flag = update_pi
+        self.eta = eta
+        self.num_iterations = num_iterations
         self.burn_in = burn_in
-        self.max_iter = max_iter
-        self.cov_reg = cov_reg
-        
-        if init_mu is None:
-            init_mu = np.random.rand(k, dim) * 20 - 10
-        self.mu = init_mu
-        
-        if init_sigma is None:
-            init_sigma = np.array([np.eye(dim) for _ in range(k)])
-        self.sigma = init_sigma
-        
-        if init_pi is None:
-            init_pi = np.ones(k) / k
-        self.pi = init_pi
-        
-        if colors is None:
-            colors = np.random.rand(k, 3)
-        self.colors = colors
-        
-        self.cov_map = PSDMap(dim)
-        
-        self.iteration = 0
-        self.avg_count = 0
-        self.mu_accum = np.zeros_like(self.mu)
-        self.sigma_accum = np.zeros_like(self.sigma)
-        
-        self.mu_avg = np.zeros_like(self.mu)
-        self.sigma_avg = np.zeros_like(self.sigma)
+        self.k = k
 
-    def init_gibbs(self, X):
-        self.data = X
-        self.num_points = X.shape[0]
-        self.z = np.zeros((self.num_points, self.k))
+        self.true_means = np.array([[2, 2], [-2, -2], [2, -2]])
+        self.true_covs = np.array([np.eye(dim) * 0.5 for _ in range(num_clusters)])
+        self.true_weights = np.array([0.4, 0.4, 0.2])
 
-    def gibbs_update(self):
-        for i in range(self.num_points):
-            posteriors = np.zeros(self.k)
-            for j in range(self.k):
-                posteriors[j] = self.pi[j] * multivariate_normal.pdf(
-                    self.data[i], mean=self.mu[j], cov=self.sigma[j]
-                )
-            total = np.sum(posteriors)
-            if total > 0:
-                posteriors /= total
-                chosen = np.random.multinomial(1, posteriors).argmax()
-                self.z[i] = np.zeros(self.k)
-                self.z[i, chosen] = 1
-            else:
-                self.z[i] = np.random.dirichlet(np.ones(self.k))
-        if self.update_pi_flag:
-            cluster_counts = np.sum(self.z, axis=0)
-            self.pi = cluster_counts / self.num_points
-            self.pi = np.maximum(self.pi, 1e-10)
-            self.pi /= np.sum(self.pi)
+        self.z = np.random.choice(num_clusters, size=num_samples, p=self.true_weights)
+        self.x = np.array([np.random.multivariate_normal(self.true_means[k], self.true_covs[k]) for k in self.z])
 
-    def sgld_update(self):
-        lr = self.learning_rate / (1.0 + self.decay * self.iteration)
-        for i in range(self.k):
-            assigned = self.data[self.z[:, i] > 0]
-            if len(assigned) == 0:
-                continue
-            grad_mu = np.zeros(self.dim)
-            for x in assigned:
-                grad_mu += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (x - self.mu[i])
-            noise_mu = np.random.normal(0, np.sqrt(2 * lr), size=self.mu[i].shape)
-            self.mu[i] += (lr * self.sigma[i] @ grad_mu / len(assigned)) + noise_mu
-            grad_sigma = np.zeros((self.dim, self.dim))
-            for x in assigned:
-                diff = (x - self.mu[i]).reshape(-1, 1)
-                grad_sigma += multivariate_normal.pdf(x, mean=self.mu[i], cov=self.sigma[i]) * (diff @ diff.T)
-            noise_sigma = np.random.normal(0, np.sqrt(2 * lr), size=self.sigma[i].shape)
-            precond_update = (2 * self.sigma[i] @ grad_sigma) / len(assigned)
-            self.sigma[i] += precond_update + noise_sigma
-            self.sigma[i] += self.cov_reg * np.eye(self.dim)
-            self.sigma[i] = self.cov_map.map(self.sigma[i])
-        if self.iteration >= self.burn_in:
-            self.avg_count += 1
-            self.mu_accum += self.mu
-            self.sigma_accum += self.sigma
-        self.iteration += 1
+        self.means = np.random.randn(num_clusters, dim)
+        self.cov_update_pattern = self._get_covariance_update_pattern(dim, k)
+        self.covs = [self.cov_update_pattern.flatten({
+            'log_sigma': np.ones(dim),
+            'low_rank': np.random.randn(dim, k)
+        }) for _ in range(num_clusters)]
+        self.weights = np.ones(num_clusters) / num_clusters
 
-    def finalize_averages(self):
-        if self.avg_count > 0:
-            self.mu_avg = self.mu_accum / self.avg_count
-            self.sigma_avg = self.sigma_accum / self.avg_count
-        else:
-            self.mu_avg = np.copy(self.mu)
-            self.sigma_avg = np.copy(self.sigma)
+        self.samples_means = []
+        self.samples_covs = []
+        self.mixing_times = []
 
-    def run(self, X):
-        self.init_gibbs(X)
-        log_likelihoods = []
-        for it in range(self.max_iter):
-            self.gibbs_update()
-            self.sgld_update()
-            ll = self.log_likelihood(X, use_avg=False)
-            log_likelihoods.append(ll)
-        self.finalize_averages()
-        return log_likelihoods
+    def _get_covariance_update_pattern(self, dim, k):
+        cov_pattern = PatternDict(free_default=True)
+        cov_pattern['log_sigma'] = NumericVectorPattern(length=dim)
+        cov_pattern['low_rank'] = NumericArrayPattern(shape=(dim, k))
+        return cov_pattern
 
-    def log_likelihood(self, X, use_avg=False):
-        if use_avg:
-            mus = self.mu_avg
-            sigmas = self.sigma_avg
-        else:
-            mus = self.mu
-            sigmas = self.sigma
-        ll = 0
-        for x in X:
-            p = 0
-            for j in range(self.k):
-                p += self.pi[j] * multivariate_normal.pdf(x, mean=mus[j], cov=sigmas[j])
-            ll += np.log(max(p, 1e-30))
-        return ll
+    def _get_full_covariance(self, param_dict):
+        diag = np.diag(np.exp(param_dict['log_sigma'])**2)
+        low_rank = param_dict['low_rank']
+        return diag + low_rank @ low_rank.T
 
-    def plot_gaussian(self, mean, cov, ax, n_std=2.0, facecolor='none', **kwargs):
-        vals, vecs = np.linalg.eigh(cov)
-        order = vals.argsort()[::-1]
-        vals, vecs = vals[order], vecs[:, order]
-        theta = np.degrees(np.arctan2(*vecs[:, 0][::-1]))
-        width, height = 2 * n_std * np.sqrt(vals)
-        ellipse = Ellipse(xy=mean, width=width, height=height, angle=theta, facecolor=facecolor, **kwargs)
-        ax.add_patch(ellipse)
-    
-    def draw(self, ax, n_std=2.0, use_avg=False, facecolor='none', **kwargs):
-        if use_avg:
-            mus = self.mu_avg
-            sigmas = self.sigma_avg
-        else:
-            mus = self.mu
-            sigmas = self.sigma
-        for i in range(self.k):
-            self.plot_gaussian(mus[i], sigmas[i], ax, n_std=n_std, edgecolor=self.colors[i], **kwargs)
+    def run(self):
+        for t in range(self.num_iterations):
+            self._gibbs_sampling()
+            self._sgld_update()
+            self._track_statistics(t)
 
+    def _gibbs_sampling(self):
+        responsibilities = np.zeros((self.num_clusters, self.num_samples))
+        for k in range(self.num_clusters):
+            param_dict = self.cov_update_pattern.fold(self.covs[k])
+            cov_k = self._get_full_covariance(param_dict)
+            responsibilities[k] = self.weights[k] * multivariate_normal.pdf(self.x, self.means[k], cov_k)
+        responsibilities /= responsibilities.sum(axis=0)
+        self.z = np.array([np.random.choice(self.num_clusters, p=responsibilities[:, i]) for i in range(self.num_samples)])
+
+    def _sgld_update(self):
+        for k in range(self.num_clusters):
+            cluster_points = self.x[self.z == k]
+            if len(cluster_points) > 0:
+                param_dict = self.cov_update_pattern.fold(self.covs[k])
+                grad = np.linalg.solve(np.diag(np.exp(2 * param_dict['log_sigma'])) + 1e-6,
+                                       (cluster_points.mean(axis=0) - self.means[k]))
+                self.means[k] += self.eta * grad + np.sqrt(2 * self.eta) * np.random.randn(self.dim)
+
+                param_dict['log_sigma'] += self.eta * np.random.randn(self.dim)
+                param_dict['low_rank'] += self.eta * np.random.randn(self.dim, self.k)
+                param_dict['log_sigma'] = np.clip(param_dict['log_sigma'], -10, 10)
+                self.covs[k] = self.cov_update_pattern.flatten(param_dict)
+
+    def _track_statistics(self, t):
+        if t >= self.burn_in:
+            self.samples_means.append(self.means.copy())
+            self.samples_covs.append(self.covs.copy())
+        if len(self.samples_means) >= 100 and t % 100 == 0:
+            mixing_time = np.linalg.norm(self.means - self.samples_means[-100], ord='fro')
+            self.mixing_times.append(mixing_time)
+
+    def plot_results(self):
+        samples_means = np.array(self.samples_means)
+        mixing_times = np.array(self.mixing_times)
+
+        plt.figure(figsize=(8, 6))
+        plt.hist(samples_means[:, :, 0].flatten(), bins=30, alpha=0.5, label='Mean (Dim 1)')
+        plt.hist(samples_means[:, :, 1].flatten(), bins=30, alpha=0.5, label='Mean (Dim 2)')
+        plt.legend()
+        plt.title("Empirical Density of Global Parameters")
+        plt.show()
+
+        plt.figure(figsize=(8, 6))
+        plt.plot(mixing_times, label="Mixing Time")
+        plt.xlabel("Iteration (x100)")
+        plt.ylabel("Frobenius Norm Difference")
+        plt.title("Mixing Time of Global Parameter and Latent Variable")
+        plt.legend()
+        plt.show()
+
+        # -------- Plot: Estimated vs True Means --------
+        plt.figure(figsize=(8, 6))
+        plt.scatter(self.true_means[:, 0], self.true_means[:, 1], c='red', marker='x', s=100, label='True Means')
+        plt.scatter(self.means[:, 0], self.means[:, 1], c='blue', marker='o', s=100, label='Estimated Means')
+        plt.legend()
+        plt.title("True vs Estimated Cluster Means")
+        plt.xlabel("Dimension 1")
+        plt.ylabel("Dimension 2")
+        plt.grid(True)
+        plt.show()
+
+        # -------- Plot: Contour of True vs Estimated GMM --------
+        x_min, x_max = self.x[:, 0].min() - 2, self.x[:, 0].max() + 2
+        y_min, y_max = self.x[:, 1].min() - 2, self.x[:, 1].max() + 2
+        xx, yy = np.meshgrid(np.linspace(x_min, x_max, 200), np.linspace(y_min, y_max, 200))
+        grid = np.c_[xx.ravel(), yy.ravel()]
+
+        # True GMM Density
+        true_density = np.zeros(len(grid))
+        for k in range(self.num_clusters):
+            true_density += self.true_weights[k] * multivariate_normal.pdf(grid, self.true_means[k], self.true_covs[k])
+        true_density = true_density.reshape(xx.shape)
+
+        # Estimated GMM Density
+        est_density = np.zeros(len(grid))
+        for k in range(self.num_clusters):
+            param_dict = self.cov_update_pattern.fold(self.covs[k])
+            cov_k = self._get_full_covariance(param_dict)
+            est_density += self.weights[k] * multivariate_normal.pdf(grid, self.means[k], cov_k)
+        est_density = est_density.reshape(xx.shape)
+
+        plt.figure(figsize=(10, 4))
+        plt.subplot(1, 2, 1)
+        plt.contourf(xx, yy, true_density, levels=20, cmap='Reds')
+        plt.title("True GMM Density")
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
+        plt.scatter(self.true_means[:, 0], self.true_means[:, 1], c='red', marker='x')
+
+        plt.subplot(1, 2, 2)
+        plt.contourf(xx, yy, est_density, levels=20, cmap='Blues')
+        plt.title("Estimated GMM Density")
+        plt.xlabel("Dim 1")
+        plt.ylabel("Dim 2")
+        plt.scatter(self.means[:, 0], self.means[:, 1], c='blue', marker='o')
+
+        plt.tight_layout()
+        plt.show()
+
+
+# Example usage
 if __name__ == "__main__":
-    np.random.seed(42)
-    k = 2
-    dim = 2
-    n_points = 500
-    true_mu = np.array([[2, 2], [-2, -2]])
-    true_sigma = np.array([
-        [[1, 0.5], [0.5, 1]],
-        [[1, -0.3], [-0.3, 1]]
-    ])
-    true_pi = np.array([0.6, 0.4])
-    data = []
-    labels = []
-    for _ in range(n_points):
-        comp = np.random.choice(k, p=true_pi)
-        sample = np.random.multivariate_normal(true_mu[comp], true_sigma[comp])
-        data.append(sample)
-        labels.append(comp)
-    data = np.array(data)
-    labels = np.array(labels)
-    gmm = GMM(
-        k=k,
-        dim=dim,
-        learning_rate=0.005,
-        decay=0.01,
-        update_pi=True,
-        burn_in=50,
-        max_iter=200,
-        cov_reg=1e-6
-    )
-    log_likelihoods = gmm.run(data)
-    final_ll_avg = gmm.log_likelihood(data, use_avg=True)
-    fig, ax = plt.subplots(figsize=(8, 6))
-    scatter = ax.scatter(data[:, 0], data[:, 1], c=labels, cmap='viridis', alpha=0.6)
-    gmm.draw(ax, n_std=2.0, use_avg=False, facecolor='none', linewidth=2)
-    ax.set_title('GMM Clustering (Final Iteration) and Gaussian Contours')
-    plt.savefig("gmm_clustering_final.png")
-    plt.show()
-    fig, ax = plt.subplots(figsize=(8, 6))
-    scatter = ax.scatter(data[:, 0], data[:, 1], c=labels, cmap='viridis', alpha=0.6)
-    gmm.draw(ax, n_std=2.0, use_avg=True, facecolor='none', linewidth=2)
-    ax.set_title('GMM Clustering (Averaged) and Gaussian Contours')
-    plt.savefig("gmm_clustering_avg.png")
-    plt.show()
-    fig2, ax2 = plt.subplots(figsize=(8, 6))
-    ax2.plot(log_likelihoods, marker='o')
-    ax2.set_title('Log Likelihood Progression')
-    ax2.set_xlabel('Iteration')
-    ax2.set_ylabel('Log Likelihood')
-    plt.savefig("log_likelihood.png")
-    plt.show()
-    print("=== True Parameters ===")
-    print("True mu:\n", true_mu)
-    print("True sigma:\n", true_sigma)
-    print("True pi:\n", true_pi)
-    print("\n=== Final Iteration Learned Parameters ===")
-    print("Final mu:\n", gmm.mu)
-    print("Final sigma:\n", gmm.sigma)
-    print("Final pi:\n", gmm.pi)
-    print("Final log likelihood (current params):", log_likelihoods[-1])
-    print("\n=== Averaged Learned Parameters ===")
-    print("Averaged mu:\n", gmm.mu_avg)
-    print("Averaged sigma:\n", gmm.sigma_avg)
-    print("Log likelihood (averaged params):", final_ll_avg)
+    model = SGLD_GMM()
+    model.run()
+    model.plot_results()
