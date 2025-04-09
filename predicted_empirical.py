@@ -15,7 +15,7 @@ class PSDMap:
         eigvals = np.maximum(eigvals, self.epsilon)
         return eigvecs @ np.diag(eigvals) @ eigvecs.T
 
-class GMM():
+class GMM:
     def __init__(self, k, dim, init_mu=None, init_sigma=None, init_pi=None, colors=None, learning_rate=0.01):
         self.k = k
         self.dim = dim
@@ -100,32 +100,42 @@ class GMM():
         for i in range(self.k):
             self.plot_gaussian(self.mu[i], self.sigma[i], ax, n_std=n_std, edgecolor=self.colors[i], **kwargs)
 
-def compute_predicted_density(mu, sigma, method="Jinv", scalematrix=1.0):
+def compute_J_component(data, mu, sigma):
+    return sigma
+
+def compute_V_component(data, mu, sigma):
+    inv_sigma = np.linalg.inv(sigma)
+    scores = np.array([inv_sigma @ (x - mu) for x in data])
+    if scores.shape[0] > 1:
+        V = np.cov(scores.T)
+    else:
+        V = np.zeros((mu.shape[0], mu.shape[0]))
+    return V
+
+def compute_predicted_density(mu, Jinv, V, method="Jinv", scalematrix=1.0):
     if method == "Jinv":
-        Jinv = np.linalg.inv(sigma)
         Jinv_sym = (Jinv + Jinv.T) / 2.0
         safe_Jinv = np.real(sqrtm(Jinv_sym @ Jinv_sym.T)) * scalematrix**2
         cov_pred = safe_Jinv
     elif method == "sandwich":
-        sigma_sym = (sigma + sigma.T) / 2.0
-        safe_sandwich = np.real(sqrtm(sigma_sym @ sigma_sym.T)) * scalematrix**2
+        V_sym = (V + V.T) / 2.0
+        safe_sandwich = np.real(sqrtm(V_sym @ V_sym.T)) * scalematrix**2
         cov_pred = safe_sandwich
     elif method == "mixture":
-        Jinv = np.linalg.inv(sigma)
         Jinv_sym = (Jinv + Jinv.T) / 2.0
         safe_Jinv = np.real(sqrtm(Jinv_sym @ Jinv_sym.T)) * scalematrix**2
-        sigma_sym = (sigma + sigma.T) / 2.0
-        safe_sandwich = np.real(sqrtm(sigma_sym @ sigma_sym.T)) * scalematrix**2
+        V_sym = (V + V.T) / 2.0
+        safe_sandwich = np.real(sqrtm(V_sym @ V_sym.T)) * scalematrix**2
         safe_mixture = 0.5 * safe_Jinv + 0.5 * safe_sandwich
         cov_pred = safe_mixture
     else:
         raise ValueError("Invalid method specified.")
     return mu, cov_pred
 
-def plot_predicted_and_empirical_density(mu, sigma, empirical_points, method="Jinv", scalematrix=1.0):
-    pred_mu, pred_cov = compute_predicted_density(mu, sigma, method, scalematrix)
-    x = np.linspace(mu[0] - 3*np.sqrt(sigma[0,0]), mu[0] + 3*np.sqrt(sigma[0,0]), 100)
-    y = np.linspace(mu[1] - 3*np.sqrt(sigma[1,1]), mu[1] + 3*np.sqrt(sigma[1,1]), 100)
+def plot_predicted_and_empirical_density(mu, Jinv, V, empirical_points, method="Jinv", scalematrix=1.0):
+    pred_mu, pred_cov = compute_predicted_density(mu, Jinv, V, method, scalematrix)
+    x = np.linspace(mu[0] - 3*np.sqrt(pred_cov[0,0]), mu[0] + 3*np.sqrt(pred_cov[0,0]), 100)
+    y = np.linspace(mu[1] - 3*np.sqrt(pred_cov[1,1]), mu[1] + 3*np.sqrt(pred_cov[1,1]), 100)
     X, Y = np.meshgrid(x, y)
     pos = np.dstack((X, Y))
     rv_pred = multivariate_normal(mean=pred_mu, cov=pred_cov)
@@ -176,9 +186,13 @@ def main():
     plt.show()
     mu_est = model.mu[0]
     sigma_est = model.sigma[0]
-    plot_predicted_and_empirical_density(mu_est, sigma_est, chain_mu0, method="Jinv", scalematrix=1.0)
-    plot_predicted_and_empirical_density(mu_est, sigma_est, chain_mu0, method="sandwich", scalematrix=1.0)
-    plot_predicted_and_empirical_density(mu_est, sigma_est, chain_mu0, method="mixture", scalematrix=1.0)
+    cluster0_data = model.data[model.z[:,0] > 0]
+    J = compute_J_component(cluster0_data, mu_est, sigma_est)
+    Jinv = J
+    V_comp = compute_V_component(cluster0_data, mu_est, sigma_est)
+    plot_predicted_and_empirical_density(mu_est, Jinv, V_comp, chain_mu0, method="Jinv", scalematrix=1.0)
+    plot_predicted_and_empirical_density(mu_est, Jinv, V_comp, chain_mu0, method="sandwich", scalematrix=1.0)
+    plot_predicted_and_empirical_density(mu_est, Jinv, V_comp, chain_mu0, method="mixture", scalematrix=1.0)
 
 if __name__ == "__main__":
     main()
